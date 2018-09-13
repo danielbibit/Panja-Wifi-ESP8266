@@ -1,148 +1,159 @@
-#include <Arduino.h>
 #include <ESP8266WiFi.h>
-#include <DNSServer.h>
+#include <WiFiClient.h>
+#include <ESP8266mDNS.h>
 #include <ESP8266WebServer.h>
+#include <ESP8266HTTPClient.h>
 #include "WiFiManager.h"
 
-WiFiServer server(9999);
+ESP8266WebServer server(80);
 
-const String BOARD_NAME = "wifi";
+const String BOARD_NAME = "WIFI";
 const int BOARD_VERSION = 0;
-const String BOARD_HOSTNAME = "ESP-1";
+const String BOARD_HOSTNAME = "esp-1";
+const String KEY = "mykey";
 
-const char* HOST = "panja-server";
-const uint16_t PORT = 9997;
+String SERVER = "http://panja-server:5000";
 
-const bool DEBUG = true;
+const bool DEBUG = false;
 
 unsigned long last_connected;
 const int RESTART_TIME = 4 * 60 * 1000;
 
-String message[10];
+void debug(String string){
+    if(DEBUG){
+        Serial.println(string);
+    }
+}
 
-// Function prototypes
-void send_to_server(String message);
-String json_builder(String action, String argument);
-bool parse_command(String s);
-void serial_flush();
-void debug(const char* c);
+// authenticate request
+int process_request(){
+    if(server.method() != HTTP_GET){
+        server.send(405, "text/plain", "Invalid method");
+        return 0;
+    }else if(server.arg("key") != KEY){
+        server.send(401, "text/plain", "Auth error");
+        return 0;
+    }else if(server.arg("key") == ""){
+        server.send(400, "text/plain", "Bad request");
+        return 0; 
+    }else{
+        return 1;
+    }
+}
+
+void handleDirection(String path){
+
+}
+// ?
+void handleNotFound(){
+    String path = server.uri();
+    int index = path.indexOf("/robot");
+    if (index >= 0) {
+        handleDirection(path);
+    }else{
+        server.send(404, "text/plain", "Service not found !");
+    }
+}
+
+// /
+void handleRoot() {
+    server.send(200, "text/plain", "Hi! I'm a panja wifi module !");
+}
+
+// /config //must have authentication
+void handleConfig(){
+    if(process_request()){
+        if(server.arg("server") != ""){
+            SERVER = server.arg("server");
+            server.send(
+                200,
+                "text/plain", 
+                "Until reboot, I'll send data to " + server.arg("panja-server")
+            );
+        }else{
+            server.send(400, "text/plain", "I dont understand");
+        }
+    }
+}
+
+// /sync //must have authentication
+void handleSync(){
+    if(process_request()){
+        server.send(200, "text/plain", "ok, sync");
+        Serial.println("0;server;status;0");
+    }
+}
+
+// /control //must have authentication
+void handleControl(){
+    if(process_request()){
+        if(server.arg("action") == "" || server.arg("args") == ""){
+            server.send(400, "text/plain", "Bad request bro");
+        }else{
+            String command = "0;server;";
+            command += server.arg("action");
+            command += ";";
+            command += server.arg("args");
+            Serial.println(command);
+            server.send(200, "text/plain", "ok");
+        }
+    }
+}
+
+void send_to_server(String message, String route){
+    HTTPClient http;
+
+    http.begin(SERVER + route);
+    http.addHeader("Content-Type", "application/json"); //Server only accepts json
+    int httpCode = http.POST(message); //Server only accepts POST
+
+    if(httpCode > 0){
+        if(httpCode == HTTP_CODE_OK) {
+            String payload = http.getString();
+            debug(payload);
+        }
+    }else{
+        debug("Something went wrong sending the message");
+    }
+
+    http.end();
+}
 
 void setup(){
-	ESP.wdtEnable(10000);
-	Serial.begin(19200);
-
-	WiFiManager wifiManager;
+    // Serial.begin(115200);
+    Serial.begin(19200);
+    
+    WiFiManager wifiManager;
 	wifiManager.setDebugOutput(DEBUG);
 
-	// WiFi.setPhyMode(WIFI_PHY_MODE_11G); // Test this to try solve b/g/n problem
 	WiFi.hostname(BOARD_HOSTNAME);
 
 	if(!wifiManager.autoConnect()){
-		debug("failed to connect and hit timeout");
 		ESP.reset();
 	}
 
-	server.begin();
+    server.onNotFound(handleNotFound);
 
-	send_to_server(json_builder("alive", "exordial_board"));
-	serial_flush();
-	Serial.println("0;server;status;0");
+    server.on("/", handleRoot);
+
+    server.on("/sync", handleSync);
+
+    server.on("/config", handleConfig);
+
+    server.on("/control", handleControl);
+    
+    server.begin();
+    
+    debug("HTTP server started");
 }
 
 void loop(){
-	if(WiFi.status() == WL_CONNECTED){
-		last_connected = millis();
-	}else if(millis() - last_connected > RESTART_TIME){
-		ESP.reset();
-	}
+    server.handleClient();
 
-	server.setNoDelay(true);
-	WiFiClient client = server.available();
-
-	if (client){
-		client.setNoDelay(true);
-		debug("CLIENT CONNECTED");
-		while (client.connected()){
-			if (client.available()){
-				debug("CLIENT AVAILABLE");
-				String line = client.readStringUntil('\n');
-				Serial.println(line);
-
-				client.print(json_builder("response", "ok"));
-				client.stop();
-				debug("CLIENT DESCONNECTED");
-				break;
-			}
-		}
-	}
-
-	if(Serial.available()){
+    if(Serial.available()){
 		String string = Serial.readStringUntil('\n');
-		send_to_server(string);
+        send_to_server(string, "/modules");
 	}
 
-	delay(1);
-}
-
-void send_to_server(String message){
-	WiFiClient client_sender;
-
-	int time_out = 3000;
-
-	client_sender.setTimeout(time_out);
-	while(!client_sender.connect(HOST, PORT)){
-		delay(1);
-	}
-
-	client_sender.print(message);
-
-	String response = client_sender.readStringUntil('\n');
-	Serial.println(response);
-
-	client_sender.stop();
-}
-
-bool parse_command(String s){
-	int n = 0;
-
-	for(int i = 0; i < 10; i++){
-		message[i] = "";
-	}
-
-	for(int i = 0; i < (int)s.length(); i++){
-		if(s.charAt(i) == ';'){
-			n += 1;
-		}else{
-			message[n].concat(s.charAt(i));
-		}
-	}
-
-	return n >= 3 ? true : false;
-}
-
-String json_builder(String action, String argument){
-	String string = "{\"version\":";
-	string.concat(BOARD_VERSION);
-	string.concat(", \"name\" : \"");
-	string.concat(BOARD_NAME);
-	string.concat("\", \"action\" : \"");
-	string.concat(action);
-	string.concat("\", \"argument\" : \"");
-	string.concat(argument);
-	string.concat("\"}");
-
-	return string;
-}
-
-void serial_flush(){
-	while(Serial.available() > 0){
-		char t = Serial.read();
-	}
-}
-
-void debug(const char* c){
-	if(DEBUG){
-		Serial.print("D: ");
-		Serial.println(c);
-	}
+    delay(1);
 }
